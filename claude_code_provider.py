@@ -8,11 +8,15 @@ Performance features:
 - Fix 2: setting_sources=["user"] skips CLAUDE.md/project-settings loading per request
 - Fix 3: StreamEvent parsing yields individual text deltas for true token streaming
 - Fix 4: ClaudeProcessPool keeps N warm subprocesses; requests skip cold-start entirely
+- Fix 5: Tool call simulation — serializes OpenAI tool schemas into the system prompt
+          and parses TOOL_CALL XML tags back out of Claude's text responses.
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable, Iterator, Optional, Union
@@ -22,6 +26,8 @@ from litellm.types.utils import GenericStreamingChunk, ModelResponse
 
 logger = logging.getLogger(__name__)
 
+_TOOL_CALL_TAG = "TOOL_CALL"
+
 _POOL_SIZE = int(os.environ.get("CLAUDE_POOL_SIZE", "2"))
 
 
@@ -29,8 +35,37 @@ _POOL_SIZE = int(os.environ.get("CLAUDE_POOL_SIZE", "2"))
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _extract_system_and_prompt(messages: list) -> tuple[Optional[str], str]:
-    """Convert OpenAI messages list to (system_prompt, conversation_prompt)."""
+def _tools_to_system_injection(tools: list) -> str:
+    """Serialize OpenAI tool schemas into a system prompt block Claude can follow."""
+    if not tools:
+        return ""
+    lines = [
+        "\n\n---\n## Available Tools\n\n",
+        f"To call a tool, emit a JSON block wrapped in `<{_TOOL_CALL_TAG}>` tags "
+        f"(exactly as shown, one tool call per response):\n\n",
+        f"<{_TOOL_CALL_TAG}>\n"
+        f'  {{"name": "tool_name", "parameters": {{...}}}}\n'
+        f"</{_TOOL_CALL_TAG}>\n\n",
+        "Wait for the tool result before calling another tool. "
+        "Tool results will appear as `[Tool result]: ...` messages.\n\n",
+    ]
+    for tool in tools:
+        fn = tool.get("function", tool)
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = json.dumps(fn.get("parameters", {}), indent=2)
+        lines.append(f"### {name}\n{desc}\nParameters:\n```json\n{params}\n```\n\n")
+    return "".join(lines)
+
+
+def _extract_system_and_prompt(
+    messages: list, tools: Optional[list] = None
+) -> tuple[Optional[str], str]:
+    """Convert OpenAI messages list to (system_prompt, conversation_prompt).
+
+    Handles system, user, assistant, and tool (result) roles.
+    Serializes tool schemas into the system prompt when provided.
+    """
     system: Optional[str] = None
     history: list[str] = []
 
@@ -38,6 +73,11 @@ def _extract_system_and_prompt(messages: list) -> tuple[Optional[str], str]:
         role = msg.get("role", "")
         content = msg.get("content", "")
 
+        if role == "system":
+            system = content
+            continue
+
+        # Flatten list-type content (multipart messages)
         if isinstance(content, list):
             content = " ".join(
                 block.get("text", "")
@@ -45,14 +85,71 @@ def _extract_system_and_prompt(messages: list) -> tuple[Optional[str], str]:
                 if block.get("type") == "text"
             )
 
-        if role == "system":
-            system = content
-        elif role == "user":
+        if role == "user":
             history.append(f"Human: {content}")
         elif role == "assistant":
-            history.append(f"Assistant: {content}")
+            # Reconstruct assistant turn: text + any tool calls it made
+            parts: list[str] = []
+            if content:
+                parts.append(content)
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                try:
+                    params = json.loads(fn.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    params = {}
+                parts.append(
+                    f"<{_TOOL_CALL_TAG}>\n"
+                    + json.dumps({"name": fn.get("name", ""), "parameters": params})
+                    + f"\n</{_TOOL_CALL_TAG}>"
+                )
+            history.append(f"Assistant: {'  '.join(parts)}")
+        elif role == "tool":
+            # Tool result — associate with the preceding assistant turn
+            tool_call_id = msg.get("tool_call_id", "")
+            history.append(f"Human: [Tool result{' id=' + tool_call_id if tool_call_id else ''}]: {content}")
+
+    if tools:
+        system = (system or "") + _tools_to_system_injection(tools)
 
     return system, "\n\n".join(history)
+
+
+def _parse_tool_calls(text: str) -> tuple[str, list]:
+    """Extract TOOL_CALL blocks from text; returns (remaining_text, openai_tool_calls)."""
+    tool_calls: list[dict] = []
+    pattern = rf"<{_TOOL_CALL_TAG}>(.*?)</{_TOOL_CALL_TAG}>"
+
+    def _extract(match: re.Match) -> str:
+        try:
+            data = json.loads(match.group(1).strip())
+            tool_calls.append({
+                "id": f"call_{len(tool_calls)}",
+                "type": "function",
+                "function": {
+                    "name": data.get("name", ""),
+                    "arguments": json.dumps(
+                        data.get("parameters", data.get("arguments", {}))
+                    ),
+                },
+            })
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        return ""
+
+    remaining = re.sub(pattern, _extract, text, flags=re.DOTALL).strip()
+    return remaining, tool_calls
+
+
+def _apply_tool_calls(model_response: ModelResponse, text: str) -> None:
+    """Parse tool calls from text and populate model_response accordingly."""
+    remaining, tool_calls = _parse_tool_calls(text)
+    if tool_calls:
+        model_response.choices[0].message.tool_calls = tool_calls
+        model_response.choices[0].message.content = remaining or None
+        model_response.choices[0].finish_reason = "tool_calls"
+    else:
+        model_response.choices[0].message.content = text
 
 
 def _embed_system(system: Optional[str], prompt: str) -> str:
@@ -265,7 +362,8 @@ class ClaudeCodeProvider(CustomLLM):
         timeout: Optional[Union[float]] = None,
         client=None,
     ) -> ModelResponse:
-        system, prompt = _extract_system_and_prompt(messages)
+        tools = optional_params.get("tools") or []
+        system, prompt = _extract_system_and_prompt(messages, tools=tools)
 
         async def _run():
             from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
@@ -296,7 +394,7 @@ class ClaudeCodeProvider(CustomLLM):
                 message=result_msg.result or "Claude Agent SDK returned an error",
             )
 
-        model_response.choices[0].message.content = text
+        _apply_tool_calls(model_response, text)
         model_response.choices[0].finish_reason = (
             result_msg.stop_reason if result_msg else "stop"
         )
@@ -324,22 +422,54 @@ class ClaudeCodeProvider(CustomLLM):
         timeout=None,
         client=None,
     ) -> Iterator[GenericStreamingChunk]:
-        system, prompt = _extract_system_and_prompt(messages)
+        tools = optional_params.get("tools") or []
+        system, prompt = _extract_system_and_prompt(messages, tools=tools)
 
         async def _collect() -> list[GenericStreamingChunk]:
             from claude_agent_sdk.types import ResultMessage, StreamEvent
 
-            chunks: list[GenericStreamingChunk] = []
+            raw_chunks: list[GenericStreamingChunk] = []
+            result_chunk: Optional[GenericStreamingChunk] = None
             async for event in _run_query(
                 prompt=prompt, system=system, model=_model_name(model), stream=True
             ):
                 if isinstance(event, StreamEvent):
                     chunk = _stream_event_to_chunk(event.event)
                     if chunk:
-                        chunks.append(chunk)
+                        raw_chunks.append(chunk)
                 elif isinstance(event, ResultMessage):
-                    chunks.append(_result_to_chunk(event))
-            return chunks
+                    result_chunk = _result_to_chunk(event)
+
+            # Reassemble full text to extract any tool calls before streaming
+            full_text = "".join(c["text"] for c in raw_chunks if c.get("text"))
+            remaining, tool_calls = _parse_tool_calls(full_text)
+
+            if tool_calls:
+                # Emit tool call deltas instead of text chunks
+                chunks: list[GenericStreamingChunk] = []
+                for i, tc in enumerate(tool_calls):
+                    chunks.append({
+                        "text": "",
+                        "is_finished": False,
+                        "finish_reason": "",
+                        "usage": None,
+                        "index": 0,
+                        "tool_use": {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": tc["function"],
+                        },
+                    })
+                if result_chunk:
+                    result_chunk["finish_reason"] = "tool_calls"
+                    chunks.append(result_chunk)
+                return chunks
+
+            # No tool calls — stream text chunks as-is
+            out = list(raw_chunks)
+            if result_chunk:
+                out.append(result_chunk)
+            return out
 
         try:
             yield from asyncio.run(_collect())
@@ -367,7 +497,8 @@ class ClaudeCodeProvider(CustomLLM):
     ) -> ModelResponse:
         from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
-        system, prompt = _extract_system_and_prompt(messages)
+        tools = optional_params.get("tools") or []
+        system, prompt = _extract_system_and_prompt(messages, tools=tools)
         text_parts: list[str] = []
         result_msg = None
 
@@ -403,7 +534,7 @@ class ClaudeCodeProvider(CustomLLM):
                 message=result_msg.result or "Claude Agent SDK returned an error",
             )
 
-        model_response.choices[0].message.content = text
+        _apply_tool_calls(model_response, text)
         model_response.choices[0].finish_reason = (
             result_msg.stop_reason if result_msg else "stop"
         )
@@ -433,31 +564,57 @@ class ClaudeCodeProvider(CustomLLM):
     ) -> AsyncIterator[GenericStreamingChunk]:
         from claude_agent_sdk.types import ResultMessage, StreamEvent
 
-        system, prompt = _extract_system_and_prompt(messages)
+        tools = optional_params.get("tools") or []
+        system, prompt = _extract_system_and_prompt(messages, tools=tools)
+
+        raw_chunks: list[GenericStreamingChunk] = []
+        result_chunk: Optional[GenericStreamingChunk] = None
+
+        async def _collect_events(source):
+            nonlocal result_chunk
+            async for event in source:
+                if isinstance(event, StreamEvent):
+                    chunk = _stream_event_to_chunk(event.event)
+                    if chunk:
+                        raw_chunks.append(chunk)
+                elif isinstance(event, ResultMessage):
+                    result_chunk = _result_to_chunk(event)
 
         if _pool is not None:
             # Fix 4: use warm pool client (always has include_partial_messages=True)
             embedded_prompt = _embed_system(system, prompt)
             async with _pool.acquire(model=_model_name(model)) as pool_client:
                 await pool_client.query(embedded_prompt)
-                async for event in pool_client.receive_response():
-                    if isinstance(event, StreamEvent):
-                        chunk = _stream_event_to_chunk(event.event)
-                        if chunk:
-                            yield chunk
-                    elif isinstance(event, ResultMessage):
-                        yield _result_to_chunk(event)
+                await _collect_events(pool_client.receive_response())
         else:
-            # Fallback: cold query with Fix 3 StreamEvent handling
-            async for event in _run_query(
-                prompt=prompt, system=system, model=_model_name(model), stream=True
-            ):
-                if isinstance(event, StreamEvent):
-                    chunk = _stream_event_to_chunk(event.event)
-                    if chunk:
-                        yield chunk
-                elif isinstance(event, ResultMessage):
-                    yield _result_to_chunk(event)
+            await _collect_events(
+                _run_query(prompt=prompt, system=system, model=_model_name(model), stream=True)
+            )
+
+        full_text = "".join(c["text"] for c in raw_chunks if c.get("text"))
+        remaining, tool_calls = _parse_tool_calls(full_text)
+
+        if tool_calls:
+            for tc in tool_calls:
+                yield {
+                    "text": "",
+                    "is_finished": False,
+                    "finish_reason": "",
+                    "usage": None,
+                    "index": 0,
+                    "tool_use": {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": tc["function"],
+                    },
+                }
+            if result_chunk:
+                result_chunk["finish_reason"] = "tool_calls"
+                yield result_chunk
+        else:
+            yield from raw_chunks
+            if result_chunk:
+                yield result_chunk
 
 
 # The instance LiteLLM references via custom_provider_map
