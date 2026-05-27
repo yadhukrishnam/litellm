@@ -1,0 +1,21 @@
+model_list:
+  - model_name: claude-agent
+    litellm_params:
+      model: claude_code/claude-sonnet-4-6
+      input_cost_per_token: 0.000003    # $3 / 1M tokens
+      output_cost_per_token: 0.000015   # $15 / 1M tokens
+
+  - model_name: claude-agent-opus
+    litellm_params:
+      model: claude_code/claude-opus-4-7
+      input_cost_per_token: 0.000015    # $15 / 1M tokens
+      output_cost_per_token: 0.000075   # $75 / 1M tokens
+
+litellm_settings:
+  custom_provider_map:
+    - {"provider": "claude_code", "custom_handler": "claude_code_provider.claude_code_handler"}
+
+general_settings:
+  master_key: sk-1234
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
