@@ -204,7 +204,10 @@ async def _run_query(
             permission_mode="dontAsk",
             include_partial_messages=stream,
             setting_sources=["user"],           # Fix 2: skip project/CLAUDE.md loading
-            extra_args={"no-session-persistence": None},  # Fix 2: skip session file I/O
+            extra_args={
+                "no-session-persistence": None,  # Fix 2: skip session file I/O
+                "strict-mcp-config": None,        # Fix 6: ignore account MCP servers (Gmail etc.)
+            },
         )
 
         async def _stdin_prompt():
@@ -248,7 +251,10 @@ class ClaudeProcessPool:
             tools=[],
             permission_mode="dontAsk",
             setting_sources=["user"],
-            extra_args={"no-session-persistence": None},
+            extra_args={
+                "no-session-persistence": None,
+                "strict-mcp-config": None,  # Fix 6: ignore account MCP servers (Gmail etc.)
+            },
             include_partial_messages=True,  # always on; non-streaming paths ignore StreamEvents
         )
         client = ClaudeSDKClient(options)
