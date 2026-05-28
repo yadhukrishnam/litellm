@@ -612,7 +612,8 @@ class ClaudeCodeProvider(CustomLLM):
                 result_chunk["finish_reason"] = "tool_calls"
                 yield result_chunk
         else:
-            yield from raw_chunks
+            for chunk in raw_chunks:
+                yield chunk
             if result_chunk:
                 yield result_chunk
 
